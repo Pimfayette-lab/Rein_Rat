@@ -1,35 +1,26 @@
-"""
-count_white_kernels.py  (v3 – CC base + area-based split for merged blobs)
---------------------------------------------------------------------------
-Strategy:
-  1. Connected-components (fast, works at 18k×18k scale)
-  2. For each blob:
-       - if area < 1.5× median nucleus area  → count as 1
-       - else estimate n = round(area / median_area) → count as n
-  This avoids the broken peak_local_max approach on large images.
-"""
-
 import numpy as np
 import cv2
 from czifile import imread
+from scipy import ndimage as ndi
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
-CZI_PATH = r"C:\Users\pimfa\Documents\MAIA\Rein_de_rat\transfer_12956536_files_7b6ebfa1\2021_05_18__0973gtAQP2nov_rbAE1.czi"
+# ─────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────
+CZI_PATH = r"C:\Users\pimfa\Documents\MAIA\Rein_de_rat\transfer_12956536_files_7b6ebfa1\2021_05_18__0986gtAQP2nov_rbAE1.czi"
 
-MIN_AREA        = 50     # px²  — drop speckles smaller than this
-MAX_AREA        = 80000  # px²  — drop giant artefacts (staining blobs etc.)
-# A blob larger than MERGE_RATIO × median_single_nucleus_area is
-# considered a cluster of merged nuclei and its count = round(area / median)
-MERGE_RATIO     = 1.6
+MIN_AREA = 50
+MAX_AREA = 80000
 
-# ── 1. Load & extract white channel ──────────────────────────────────────────
+MERGE_RATIO = 1.6
+CIRCULARITY_TH = 0.65
+SOLIDITY_TH = 0.90
+
+# ─────────────────────────────────────────────────────────────
+# 1. LOAD IMAGE
+# ─────────────────────────────────────────────────────────────
 img = np.squeeze(imread(CZI_PATH))
-print(f"Full image shape : {img.shape}  dtype: {img.dtype}")
-
 white_raw = img[0]
-print(f"White channel    : {white_raw.shape}  min={white_raw.min()}  max={white_raw.max()}")
 
-# ── 2. Normalise → uint8 ─────────────────────────────────────────────────────
 def to_uint8(arr):
     arr = arr.astype(np.float32)
     arr -= arr.min()
@@ -37,73 +28,117 @@ def to_uint8(arr):
         arr /= arr.max()
     return (arr * 255).astype(np.uint8)
 
-white_u8 = to_uint8(white_raw)
+white = to_uint8(white_raw)
 
-# ── 3. Blur + Otsu threshold ─────────────────────────────────────────────────
-blur = cv2.GaussianBlur(white_u8, (5, 5), 1)
-_, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+# ─────────────────────────────────────────────────────────────
+# 2. PREPROCESS + THRESHOLD
+# ─────────────────────────────────────────────────────────────
+blur = cv2.GaussianBlur(white, (5, 5), 1)
+_, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-# Opening: remove tiny speckles
-k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-mask = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, k, iterations=1)
+kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+mask = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel, iterations=1)
 
-cv2.imwrite("white_channel_mask.png", mask)
-print("Binary mask saved → white_channel_mask.png")
+# ─────────────────────────────────────────────────────────────
+# 3. CONNECTED COMPONENTS
+# ─────────────────────────────────────────────────────────────
+num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, 8)
 
-# ── 4. Connected components ───────────────────────────────────────────────────
-num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-    mask, connectivity=8
-)
-print(f"Raw CC (excl. background): {num_labels - 1}")
+# ─────────────────────────────────────────────────────────────
+# 4. COLLECT BLOBS + SHAPE FEATURES
+# ─────────────────────────────────────────────────────────────
+blobs = []
 
-# ── 5. Collect blobs in valid area range ─────────────────────────────────────
-blobs = []   # (label_id, area, cx, cy)
 for i in range(1, num_labels):
-    area = int(stats[i, cv2.CC_STAT_AREA])
-    if MIN_AREA <= area <= MAX_AREA:
-        cx = int(centroids[i][0])
-        cy = int(centroids[i][1])
-        blobs.append((i, area, cx, cy))
+    area = stats[i, cv2.CC_STAT_AREA]
+    if area < MIN_AREA or area > MAX_AREA:
+        continue
 
-areas = np.array([b[1] for b in blobs])
-print(f"Blobs after area filter [{MIN_AREA}–{MAX_AREA} px²]: {len(blobs)}")
+    x = stats[i, cv2.CC_STAT_LEFT]
+    y = stats[i, cv2.CC_STAT_TOP]
+    w = stats[i, cv2.CC_STAT_WIDTH]
+    h = stats[i, cv2.CC_STAT_HEIGHT]
 
-# ── 6. Estimate single-nucleus area from the distribution ────────────────────
-# The mode / lower half of the area histogram represents single nuclei.
-# We take the median of the smallest 70% of blobs as our reference size.
-cutoff = np.percentile(areas, 70)
-single_areas = areas[areas <= cutoff]
-median_single = float(np.median(single_areas)) if len(single_areas) else float(np.median(areas))
-print(f"Estimated single-nucleus area: {median_single:.1f} px²")
+    blob_mask = (labels[y:y+h, x:x+w] == i).astype(np.uint8)
 
-# ── 7. Count nuclei (1 per blob, or estimated n if blob is a cluster) ────────
-total_nuclei = 0
-annotations  = []   # (cx, cy, count_in_blob)
+    # perimeter
+    contours, _ = cv2.findContours(blob_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if len(contours) == 0:
+        continue
 
-for (lid, area, cx, cy) in blobs:
-    if area < MERGE_RATIO * median_single:
+    perimeter = cv2.arcLength(contours[0], True) + 1e-6
+    circularity = 4 * np.pi * area / (perimeter ** 2)
+
+    hull = cv2.convexHull(contours[0])
+    hull_area = cv2.contourArea(hull) + 1e-6
+    solidity = area / hull_area
+
+    cx, cy = centroids[i]
+
+    blobs.append({
+        "id": i,
+        "area": area,
+        "cx": int(cx),
+        "cy": int(cy),
+        "bbox": (x, y, w, h),
+        "circularity": circularity,
+        "solidity": solidity
+    })
+
+areas = np.array([b["area"] for b in blobs])
+median_single = np.median(areas[areas < np.percentile(areas, 70)])
+
+print("Estimated single nucleus area:", median_single)
+
+# ─────────────────────────────────────────────────────────────
+# 5. WATERSHED SPLITTER (for clusters)
+# ─────────────────────────────────────────────────────────────
+def split(blob):
+    dist = cv2.distanceTransform(blob, cv2.DIST_L2, 5)
+
+    # adaptive threshold (key upgrade)
+    peaks = (dist > (0.5 * dist.max() + 0.5 * dist.mean())).astype(np.uint8)
+    
+    return max(1, cv2.connectedComponents(peaks)[0] - 1)
+
+# ─────────────────────────────────────────────────────────────
+# 6. COUNT NUCLEI
+# ─────────────────────────────────────────────────────────────
+total = 0
+annotations = []
+
+for b in blobs:
+    i = b["id"]
+    area = b["area"]
+
+    x, y, w, h = b["bbox"]
+    full_mask = (labels[y:y+h, x:x+w] == i).astype(np.uint8)
+
+    is_large = area > MERGE_RATIO * median_single
+    is_irregular = (b["circularity"] < CIRCULARITY_TH) or (b["solidity"] < SOLIDITY_TH)
+
+    if not (is_large or is_irregular):
         n = 1
     else:
-        n = max(1, round(area / median_single))
-    total_nuclei += n
-    annotations.append((cx, cy, n))
+        n = split(full_mask)
 
-print(f"\n{'='*54}")
-print(f"  Valid blobs (connected components) : {len(blobs)}")
-print(f"  Estimated single-nucleus area      : {median_single:.0f} px²")
-print(f"  TOTAL WHITE NUCLEI (with splits)   : {total_nuclei}")
-print(f"{'='*54}\n")
+    total += n
+    annotations.append((b["cx"], b["cy"], n))
 
-# ── 8. Annotated output ───────────────────────────────────────────────────────
-vis = cv2.cvtColor(white_u8, cv2.COLOR_GRAY2BGR)
+# ─────────────────────────────────────────────────────────────
+# 7. VISUALIZATION
+# ─────────────────────────────────────────────────────────────
+vis = cv2.cvtColor(white, cv2.COLOR_GRAY2BGR)
 
-for (cx, cy, n) in annotations:
-    color = (0, 0, 255) if n == 1 else (0, 165, 255)   # red=single, orange=cluster
-    cv2.circle(vis, (cx, cy), 5 if n == 1 else 8, color, 2)
+for cx, cy, n in annotations:
+    color = (0, 0, 255) if n == 1 else (0, 165, 255)
+    cv2.circle(vis, (cx, cy), 6, color, 2)
     if n > 1:
-        cv2.putText(vis, f"x{n}", (cx + 6, cy - 3),
+        cv2.putText(vis, f"x{n}", (cx+5, cy),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 255), 1)
 
-cv2.imwrite("white_channel_counted.png", vis)
-print("Annotated image saved → white_channel_counted.png")
-print(f">>> TOTAL WHITE NUCLEI: {total_nuclei} <<<")
+cv2.imwrite("improved_nuclei_count.png", vis)
+
+print("\n==============================")
+print("TOTAL NUCLEI:", total)
+print("==============================")
