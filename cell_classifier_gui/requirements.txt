@@ -1,0 +1,6 @@
+numpy
+opencv-python
+czifile
+scikit-learn
+tqdm
+Pillow
