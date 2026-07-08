@@ -1,0 +1,16 @@
+=== RAPPORT DE COMPARAISON watershed vs cellpose ===
+Fichier         : C:/Users/pimfa/Documents/MAIA/Rein_de_rat/transfer_12956536_files_7b6ebfa1/2021_05_18__0969gtAQP2nov_rbAE1.czi
+Résolution      : 7465x8192 px
+Seuil d'appariement : 18.0 px
+
+Watershed       : 38844 noyaux en 2.4s
+Cellpose        : 62006 noyaux en 171.2s
+Ratio temps     : cellpose 70.0x plus lent que watershed
+
+Appariés (les deux méthodes s'accordent) : 36787
+Watershed seul (cellpose a raté)          : 2057
+Cellpose seul (watershed a raté)           : 25219
+Accord global : 59.3% (par rapport au plus grand des deux comptages)
+
+Aires watershed : médiane=69px²  moyenne=90px²  min=25  max=6712
+Aires cellpose  : médiane=68px²  moyenne=70px²  min=50  max=273

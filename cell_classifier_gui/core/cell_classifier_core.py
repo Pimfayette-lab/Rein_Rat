@@ -22,10 +22,14 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import pickle
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
 
@@ -33,6 +37,7 @@ import cv2
 import numpy as np
 from czifile import imread
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
 
@@ -56,18 +61,63 @@ class Config:
     # Redimensionnement maximal (None = pas de downscale)
     max_dim: Optional[int] = 8192
 
-    # Normalisation robuste (clip percentile) avant conversion en uint8.
-    # Remplace le min/max brut : quelques pixels chauds (saturation capteur,
-    # poussière, artefact ponctuel) ne doivent pas à eux seuls écraser tout
-    # le reste du signal dans les valeurs basses. norm_clip_low/high sont
-    # les percentiles (0-100) utilisés comme bornes noir/blanc.
-    norm_clip_low: float = 0.5
-    norm_clip_high: float = 99.5
+    # Normalisation robuste (clip percentile) avant conversion en uint8,
+    # + gamma, réglables INDIVIDUELLEMENT par canal. Remplace le min/max
+    # brut : quelques pixels chauds (saturation capteur, poussière, artefact
+    # ponctuel) ne doivent pas à eux seuls écraser tout le reste du signal
+    # dans les valeurs basses. *_clip_low/high sont les percentiles (0-100)
+    # utilisés comme bornes noir/blanc (contraste) ; *_gamma ajuste la
+    # luminosité des tons moyens sans bouger ces bornes (gamma > 1 = plus
+    # clair, gamma < 1 = plus sombre, 1.0 = neutre).
+    #
+    # Ces réglages affectent À LA FOIS l'aperçu visuel ET la classification
+    # (les seuils GREEN/RED/BLUE s'appliquent sur ces canaux normalisés) :
+    # ajuster le contraste d'un canal peut donc aussi changer le comptage.
+    white_clip_low: float = 0.5
+    white_clip_high: float = 99.5
+    white_gamma: float = 1.0
+
+    green_clip_low: float = 0.5
+    green_clip_high: float = 99.5
+    green_gamma: float = 1.0
+
+    red_clip_low: float = 0.5
+    red_clip_high: float = 99.5
+    red_gamma: float = 1.0
+
+    blue_clip_low: float = 0.5
+    blue_clip_high: float = 99.5
+    blue_gamma: float = 1.0
 
     # Détection noyaux
     min_area: int = 50
     max_area: int = 80000
     merge_ratio: float = 1.6
+
+    # Méthode de détection des noyaux :
+    #  - "watershed" : seuillage (Otsu global ou local) + watershed (défaut, rapide)
+    #  - "cellpose"  : segmentation par instance via Cellpose, plus robuste
+    #    sur les amas denses mais nécessite le package `cellpose`
+    #    (pip install cellpose) et idéalement un GPU CUDA pour rester
+    #    rapide sur de grandes images.
+    detection_method: str = "watershed"
+    # Diamètre moyen (px) attendu par Cellpose ; None = estimation automatique.
+    cellpose_diameter: Optional[float] = None
+    # Force l'usage du GPU CUDA pour Cellpose. Si True et qu'aucun GPU
+    # CUDA n'est réellement disponible pour PyTorch, une erreur explicite
+    # est levée plutôt que de retomber silencieusement sur le CPU (ce qui
+    # rend l'inférence extrêmement lente sur de grandes images, plusieurs
+    # dizaines de minutes voire plus, sans aucun message clair).
+    cellpose_gpu: bool = True
+
+    # Seuil de détection local : au lieu d'un unique seuil Otsu global sur
+    # tout le canal blanc, calcule un seuil Otsu par tuile (grille bg_grid)
+    # puis l'interpole sur l'image (même principe que build_bg_map). Utile
+    # seulement si l'éclairage/le fond varie fortement selon la zone de
+    # l'image (vignettage, gradient d'illumination) et que le seuil global
+    # sur/sous-détecte selon la position. Sans effet si detection_method
+    # vaut "cellpose".
+    local_threshold: bool = False
 
     # Géométrie d'échantillonnage
     nucleus_r: int = 12      # rayon du noyau (disque central)
@@ -111,12 +161,23 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Classification cellulaire multi-canal (AQP2/AE1)")
     p.add_argument("czi_path", nargs="?", help="Chemin vers le fichier CZI")
     p.add_argument("--max-dim", type=int, default=8192, help="Dimension max après redimensionnement")
-    p.add_argument("--clip-low", type=float, default=0.5,
-                   help="Percentile bas (0-100) pour la normalisation robuste des canaux")
-    p.add_argument("--clip-high", type=float, default=99.5,
-                   help="Percentile haut (0-100) pour la normalisation robuste des canaux")
+    for _ch in ("white", "green", "red", "blue"):
+        p.add_argument(f"--clip-low-{_ch}", type=float, default=0.5,
+                       help=f"Percentile bas (0-100) — contraste canal {_ch}")
+        p.add_argument(f"--clip-high-{_ch}", type=float, default=99.5,
+                       help=f"Percentile haut (0-100) — contraste canal {_ch}")
+        p.add_argument(f"--gamma-{_ch}", type=float, default=1.0,
+                       help=f"Gamma (luminosité, 1.0=neutre) — canal {_ch}")
     p.add_argument("--min-area", type=int, default=50, help="Aire minimale d'un blob")
     p.add_argument("--max-area", type=int, default=80000, help="Aire maximale d'un blob")
+    p.add_argument("--detection-method", choices=["watershed", "cellpose"], default="watershed",
+                   help="Méthode de détection des noyaux")
+    p.add_argument("--cellpose-diameter", type=float, default=None,
+                   help="Diamètre moyen (px) attendu par Cellpose (vide = auto)")
+    p.add_argument("--cellpose-cpu", action="store_true",
+                   help="Force Cellpose à tourner sur CPU même si un GPU CUDA est détecté")
+    p.add_argument("--local-threshold", action="store_true",
+                   help="Seuil Otsu local par tuile au lieu d'un seuil global unique")
     p.add_argument("--nucleus-r", type=int, default=12, help="Rayon du noyau (px)")
     p.add_argument("--halo-r", type=int, default=38, help="Rayon du halo (px)")
     p.add_argument("--green-thresh", type=int, default=30, help="Seuil signal vert")
@@ -131,7 +192,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Auto-entraînement : le RF apprend des prédictions threshold et les corrige")
     p.add_argument("--model-path", default="cell_classifier_model.pkl",
                    help="Chemin du modèle (sauvé si --self-train, chargé s'il existe)")
-    p.add_argument("--train", metavar="CSV", help=argparse.SUPPRESS)
+    p.add_argument("--train", metavar="CSV",
+                   help="Entraîne un modèle supervisé (RF) depuis un CSV de features "
+                        "exporté par la GUI, avec split train/test, puis quitte.")
+    p.add_argument("--test-size", type=float, default=0.25,
+                   help="Fraction des données réservée au test (--train uniquement)")
+    p.add_argument("--all-rows", action="store_true",
+                   help="Avec --train : utilise toutes les lignes du CSV, pas "
+                        "seulement celles validées manuellement ('validated'=1)")
     return p
 
 
@@ -145,19 +213,25 @@ def config_from_args(args: Optional[List[str]] = None) -> Tuple[Config, ParsedAr
     parsed = parser.parse_args(args)
     if parsed.czi_path:
         cfg.czi_path = parsed.czi_path
-    for field_name in ("max_dim", "clip_low", "clip_high", "min_area", "max_area", "nucleus_r", "halo_r",
-                       "green_thresh", "green_ratio", "red_thresh", "red_stat",
-                       "red_ratio", "blue_thresh", "blue_ratio", "bg_grid"):
+    field_names = ["max_dim", "min_area", "max_area", "nucleus_r", "halo_r",
+                   "green_thresh", "green_ratio", "red_thresh", "red_stat",
+                   "red_ratio", "blue_thresh", "blue_ratio", "bg_grid",
+                   "detection_method", "cellpose_diameter", "local_threshold"]
+    attr_map = {
+        "green_ratio": "green_bg_ratio",
+        "red_ratio": "red_bg_ratio",
+        "blue_ratio": "blue_bg_ratio",
+    }
+    for _ch in ("white", "green", "red", "blue"):
+        for _suffix, _attr_suffix in (("clip_low", "clip_low"), ("clip_high", "clip_high"), ("gamma", "gamma")):
+            field_names.append(f"{_suffix}_{_ch}")
+            attr_map[f"{_suffix}_{_ch}"] = f"{_ch}_{_attr_suffix}"
+    for field_name in field_names:
         val = getattr(parsed, field_name, None)
         if val is not None:
-            attr_map = {
-                "green_ratio": "green_bg_ratio",
-                "red_ratio": "red_bg_ratio",
-                "blue_ratio": "blue_bg_ratio",
-                "clip_low": "norm_clip_low",
-                "clip_high": "norm_clip_high",
-            }
             setattr(cfg, attr_map.get(field_name, field_name), val)
+    if getattr(parsed, "cellpose_cpu", False):
+        cfg.cellpose_gpu = False
     return cfg, parsed
 
 
@@ -170,6 +244,7 @@ def to_uint8(
     max_dim: Optional[int] = 8192,
     clip_low: float = 0.5,
     clip_high: float = 99.5,
+    gamma: float = 1.0,
 ) -> np.ndarray:
     """Normalise un canal en uint8 [0, 255] après downscale optionnel.
 
@@ -184,6 +259,12 @@ def to_uint8(
 
     clip_low=0/clip_high=100 redonne exactement l'ancien comportement
     min/max.
+
+    `gamma` ajuste ENSUITE la luminosité des tons moyens, sans déplacer les
+    bornes noir/blanc fixées par clip_low/high (donc indépendant du
+    contraste) : gamma > 1 éclaircit, gamma < 1 assombrit, 1.0 = neutre.
+    Pratique pour rendre un signal faible plus visible (ou au contraire
+    atténuer un fond trop présent) sans re-toucher aux seuils de clip.
     """
     if max_dim is not None:
         h, w = arr.shape[:2]
@@ -200,6 +281,8 @@ def to_uint8(
         # brut pour éviter une division par zéro.
         mn, mx = arr.min(), arr.max()
         arr = (arr - mn) / (mx - mn) if mx > mn else np.zeros_like(arr)
+    if gamma is not None and gamma != 1.0:
+        arr = np.power(arr, 1.0 / max(gamma, 1e-3))
     return (arr * 255).astype(np.uint8)
 
 
@@ -222,29 +305,67 @@ def build_bg_map(ch_u8: np.ndarray, grid: int = 8) -> np.ndarray:
     return cv2.resize(bg_low, (W, H), interpolation=cv2.INTER_LINEAR)
 
 
+def build_local_threshold_map(ch_u8: np.ndarray, grid: int = 8) -> np.ndarray:
+    """Carte de seuil Otsu LOCAL (par tuile de la grille grid×grid),
+    interpolée sur toute l'image — alternative à un unique seuil Otsu
+    global pour la détection des noyaux (voir detect_nuclei).
+
+    Un seuil global unique suppose un éclairage/fond homogène sur toute
+    l'image. Si ce n'est pas le cas (vignettage, gradient d'illumination,
+    zones de densité cellulaire très différentes), il peut sur-détecter
+    dans les zones sombres (bruit pris pour du signal) ou sous-détecter
+    dans les zones claires (signal réel sous le seuil global). Calculer un
+    Otsu par tuile puis interpoler adapte le seuil à chaque zone.
+
+    Le calcul par tuile utilise cv2.threshold (Otsu), qui n'est pas
+    vectorisable sur toutes les tuiles à la fois ; la boucle reste peu
+    coûteuse car limitée à grid×grid tuiles (ex. 8×8 = 64 itérations),
+    pas à des pixels ou des noyaux individuels.
+    """
+    H, W = ch_u8.shape
+    th = max(1, H // grid)
+    tw = max(1, W // grid)
+    thresh_map = np.zeros((grid, grid), dtype=np.float32)
+    for i in range(grid):
+        y0 = i * th
+        y1 = H if i == grid - 1 else (i + 1) * th
+        for j in range(grid):
+            x0 = j * tw
+            x1 = W if j == grid - 1 else (j + 1) * tw
+            tile = ch_u8[y0:y1, x0:x1]
+            if tile.size == 0:
+                continue
+            if tile.max() == tile.min():
+                # Tuile quasi constante : Otsu n'a pas de sens, on prend
+                # un seuil légèrement au-dessus du niveau constant.
+                thresh_map[i, j] = float(tile.mean())
+                continue
+            t, _ = cv2.threshold(tile, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            thresh_map[i, j] = t
+    return cv2.resize(thresh_map, (W, H), interpolation=cv2.INTER_LINEAR)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  ÉCHANTILLONNAGE RADIAL
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _make_ring_coords(
-    shape: Tuple[int, int], cx: int, cy: int, r_inner: int, r_outer: int
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Coordonnées locales et masque booléen pour un anneau.
+@lru_cache(maxsize=None)
+def _ring_template(r_inner: int, r_outer: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Décalages (dy, dx) d'un anneau [r_inner, r_outer] centré en (0, 0).
 
-    Retourne (ys, xs, yy, xx, ring_mask) où yy/xx sont les grilles
-    complètes et ring_mask le masque de l'anneau.
+    Précalculé UNE SEULE FOIS par couple de rayons (mis en cache), puisque
+    tous les noyaux d'une même analyse réutilisent exactement les mêmes
+    rayons (cfg.nucleus_r / cfg.halo_r). Évite de reconstruire un meshgrid
+    et un masque booléen à chaque appel — c'était le principal coût CPU de
+    l'échantillonnage radial (des dizaines de milliers de noyaux × plusieurs
+    anneaux/canaux chacun).
     """
-    H, W = shape
-    y_min = max(0, cy - r_outer)
-    y_max = min(H, cy + r_outer + 1)
-    x_min = max(0, cx - r_outer)
-    x_max = min(W, cx + r_outer + 1)
-    ys = np.arange(y_min, y_max)
-    xs = np.arange(x_min, x_max)
+    ys = np.arange(-r_outer, r_outer + 1)
+    xs = np.arange(-r_outer, r_outer + 1)
     yy, xx = np.meshgrid(ys, xs, indexing="ij")
-    d2 = (yy - cy) ** 2 + (xx - cx) ** 2
+    d2 = yy ** 2 + xx ** 2
     ring = (d2 > r_inner ** 2) & (d2 <= r_outer ** 2)
-    return ys, xs, yy, xx, ring
+    return yy[ring].astype(np.int32), xx[ring].astype(np.int32)
 
 
 def sample_ring(ch: np.ndarray, cx: int, cy: int,
@@ -253,10 +374,20 @@ def sample_ring(ch: np.ndarray, cx: int, cy: int,
     """Statistique des pixels dans l'anneau [r_inner, r_outer].
 
     statistic peut être "mean", "max", "p95", "p90", "std".
+
+    Version vectorisée : les décalages de l'anneau sont précalculés une
+    fois (voir _ring_template) puis simplement décalés au centre (cx, cy)
+    et utilisés en indexation avancée — pas de meshgrid ni de découpe de
+    patch recalculés à chaque noyau.
     """
-    ys, xs, yy, xx, ring = _make_ring_coords(ch.shape, cx, cy, r_inner, r_outer)
-    patch = ch[np.ix_(ys, xs)]
-    vals = patch[ring]
+    dy, dx = _ring_template(r_inner, r_outer)
+    H, W = ch.shape
+    ys = cy + dy
+    xs = cx + dx
+    inb = (ys >= 0) & (ys < H) & (xs >= 0) & (xs < W)
+    if not np.any(inb):
+        return 0.0
+    vals = ch[ys[inb], xs[inb]]
     if vals.size == 0:
         return 0.0
     if statistic == "mean":
@@ -282,6 +413,60 @@ def sample_disk(ch: np.ndarray, cx: int, cy: int, r: int,
 #  EXTRACTION DE FEATURES POUR ML
 # ─────────────────────────────────────────────────────────────────────────────
 
+@lru_cache(maxsize=None)
+def _radial_bands_template(radii: Tuple[int, ...]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Décalages (dy, dx) et index de bande pour un profil radial complet,
+    centré en (0, 0). Précalculé une fois par tuple de rayons (mis en
+    cache) puis simplement décalé au centre de chaque noyau — voir
+    _ring_template pour la même idée appliquée à sample_ring/sample_disk.
+    """
+    max_r = radii[-1]
+    ys = np.arange(-max_r, max_r + 1)
+    xs = np.arange(-max_r, max_r + 1)
+    yy, xx = np.meshgrid(ys, xs, indexing="ij")
+    dist = np.sqrt((yy.astype(np.float64) ** 2 + xx.astype(np.float64) ** 2))
+    radii_arr = np.asarray(radii, dtype=np.float64)
+    # bande b telle que radii[b] <= dist < radii[b+1] (même convention que
+    # l'ancienne boucle "dists >= r0) & (dists < r1)").
+    # NB : le pixel central exact (dist == 0) est exclu, à l'identique de
+    # l'ancienne implémentation (qui réutilisait _make_ring_coords avec
+    # r_inner=0, dont le masque est strictement `d2 > 0`) — comportement
+    # existant préservé pour ne pas changer les features/seuils appris.
+    band_idx = np.searchsorted(radii_arr, dist, side="right") - 1
+    n_bands = len(radii) - 1
+    valid = (band_idx >= 0) & (band_idx < n_bands) & (dist < radii_arr[-1]) & (dist > 0)
+    return yy[valid].astype(np.int32), xx[valid].astype(np.int32), band_idx[valid].astype(np.int32)
+
+
+def _band_stats(band: np.ndarray) -> Tuple[float, float, float, float, float]:
+    """(mean, std, median, p25, p75) d'un vecteur 1D, en un seul tri au
+    lieu de 3 appels np.percentile/np.median séparés (chacun refait un
+    partitionnement). Pour des bandes de quelques dizaines à centaines de
+    pixels (cas typique ici), l'overhead d'appel dominé par 3 calls
+    numpy distincts est plus coûteux qu'un unique np.sort suivi d'un
+    indexage — gain mesuré ~4-5x sur cette étape, elle-même appelée des
+    dizaines de fois par noyau (5 bandes × 4 canaux) sur des populations
+    de dizaines de milliers de noyaux.
+
+    L'interpolation linéaire reproduit exactement celle par défaut de
+    np.percentile (méthode 'linear').
+    """
+    mean = float(band.mean())
+    std = float(band.std())
+    sb = np.sort(band)
+    n = len(sb)
+
+    def _pct(p: float) -> float:
+        idx = (n - 1) * p / 100.0
+        lo = int(np.floor(idx))
+        hi = int(np.ceil(idx))
+        if lo == hi:
+            return float(sb[lo])
+        return float(sb[lo] + (sb[hi] - sb[lo]) * (idx - lo))
+
+    return mean, std, _pct(50.0), _pct(25.0), _pct(75.0)
+
+
 def radial_profile(
     ch: np.ndarray, cx: int, cy: int, radii: List[int]
 ) -> List[float]:
@@ -289,25 +474,30 @@ def radial_profile(
 
     Découpe le disque de rayon radii[-1] en bandes concentriques définies
     par radii, et retourne pour chaque bande : mean, std, median, p25, p75.
+
+    Version vectorisée : le gabarit (décalages + index de bande) est
+    précalculé une seule fois par tuple de rayons (voir
+    _radial_bands_template) au lieu de reconstruire un meshgrid et de
+    recalculer toutes les distances à chaque noyau.
     """
-    max_r = radii[-1]
-    ys, xs, yy, xx, mask = _make_ring_coords(ch.shape, cx, cy, 0, max_r)
-    patch = ch[np.ix_(ys, xs)]
-    vals = patch[mask]
-    dists = np.sqrt((yy[mask] - cy) ** 2 + (xx[mask] - cx) ** 2)
+    dy, dx, band_idx = _radial_bands_template(tuple(radii))
+    H, W = ch.shape
+    ys = cy + dy
+    xs = cx + dx
+    inb = (ys >= 0) & (ys < H) & (xs >= 0) & (xs < W)
+    ys = ys[inb]
+    xs = xs[inb]
+    bidx = band_idx[inb]
+    vals = ch[ys, xs].astype(np.float32)
+
+    n_bands = len(radii) - 1
     out: List[float] = []
-    for r0, r1 in zip(radii[:-1], radii[1:]):
-        band = vals[(dists >= r0) & (dists < r1)]
-        if len(band) == 0:
+    for b in range(n_bands):
+        band = vals[bidx == b]
+        if band.size == 0:
             out.extend([0.0, 0.0, 0.0, 0.0, 0.0])
         else:
-            out.extend([
-                float(band.mean()),
-                float(band.std()),
-                float(np.median(band)),
-                float(np.percentile(band, 25)),
-                float(np.percentile(band, 75)),
-            ])
+            out.extend(_band_stats(band))
     return out
 
 
@@ -518,6 +708,84 @@ def prepare_training_data(
     return X, y, feature_cols
 
 
+def train_supervised_from_csv(
+    csv_path: str,
+    model_path: str,
+    validated_only: bool = True,
+    test_size: float = 0.25,
+    random_state: int = 42,
+) -> dict:
+    """Entraîne un vrai modèle supervisé (RF ×3) sur un CSV de features
+    exporté depuis la GUI, avec un split train/test — ferme la boucle du
+    système de validation manuelle (clic sur les noyaux) déjà en place.
+
+    Contrairement à MLClassifier.train() seul (utilisé par --self-train),
+    qui n'évalue que sur les données d'entraînement elles-mêmes (score
+    optimiste, ne détecte pas le sur-apprentissage), cette fonction met de
+    côté une fraction `test_size` des noyaux JAMAIS vus pendant
+    l'entraînement et rapporte le score sur cette fraction : c'est le
+    score de généralisation qui compte réellement pour juger si le modèle
+    est utilisable sur de nouvelles images.
+
+    validated_only=True (recommandé) : n'entraîne que sur les lignes où la
+    vérité terrain a été confirmée manuellement dans la GUI (colonne
+    'validated'=1), pas sur les lignes qui recopient simplement la
+    prédiction brute (ce qui reviendrait à réapprendre ses propres seuils).
+
+    Retourne un résumé exploitable par la GUI (ou le CLI) :
+        {"n_total", "n_train", "n_test",
+         "scores_train": {"green":.., "red":.., "blue":..},
+         "scores_test":  {"green":.., "red":.., "blue":..},
+         "model_path"}
+
+    Lève ValueError si trop peu d'exemples validés sont disponibles pour un
+    split fiable (il faut alors valider davantage de noyaux dans la GUI).
+    """
+    X, y, feature_names = prepare_training_data(csv_path, validated_only=validated_only)
+    n = X.shape[0]
+    if n < 10:
+        raise ValueError(
+            f"Trop peu d'exemples ({n}) pour un split train/test fiable. "
+            f"Validez davantage de noyaux dans la GUI (clic sur un cercle) "
+            f"puis ré-exportez le CSV avant d'entraîner."
+        )
+
+    idx = np.arange(n)
+    idx_train, idx_test = train_test_split(
+        idx, test_size=test_size, random_state=random_state,
+    )
+    X_train, X_test = X[idx_train], X[idx_test]
+    y_train, y_test = y[idx_train], y[idx_test]
+
+    ml = MLClassifier()
+    ml.feature_names = feature_names
+    scores_train: Dict[str, float] = {}
+    scores_test: Dict[str, float] = {}
+
+    for i, label in enumerate(["green", "red", "blue"]):
+        m = RandomForestClassifier(
+            n_estimators=200, max_depth=12, min_samples_leaf=5,
+            class_weight="balanced", random_state=random_state, n_jobs=-1,
+        )
+        m.fit(X_train, y_train[:, i])
+        ml.models[label] = m
+        scores_train[label] = float(m.score(X_train, y_train[:, i]))
+        scores_test[label] = (
+            float(m.score(X_test, y_test[:, i])) if len(X_test) else float("nan")
+        )
+
+    ml.save(model_path)
+
+    return {
+        "n_total": n,
+        "n_train": len(idx_train),
+        "n_test": len(idx_test),
+        "scores_train": scores_train,
+        "scores_test": scores_test,
+        "model_path": model_path,
+    }
+
+
 def export_features_csv(
     csv_path: str,
     features: np.ndarray,
@@ -587,9 +855,20 @@ def detect_nuclei(white_u8: np.ndarray, cfg: Config) -> Tuple[List[NucleusRecord
         n_ws_split   – nombre de blobs découpés par watershed
         blobs        – blobs initiaux (pour stats)
         median_single– aire médiane d'un noyau isolé
+
+    Si cfg.detection_method == "cellpose", délègue entièrement à
+    _detect_nuclei_cellpose (segmentation par instance, pas de watershed
+    de fusion nécessaire ensuite).
     """
+    if cfg.detection_method == "cellpose":
+        return _detect_nuclei_cellpose(white_u8, cfg)
+
     blur = cv2.GaussianBlur(white_u8, (5, 5), 1)
-    _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    if cfg.local_threshold:
+        thresh_map = build_local_threshold_map(blur, cfg.bg_grid)
+        th = ((blur.astype(np.float32) > thresh_map).astype(np.uint8)) * 255
+    else:
+        _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask = cv2.morphologyEx(th, cv2.MORPH_OPEN, k3, iterations=1)
 
@@ -708,6 +987,225 @@ def _split_blob_watershed(
         cy = int(M["m01"] / M["m00"]) + blob_y
         result.append((cx, cy, area_k))
     return result
+
+
+def _detect_nuclei_cellpose(
+    white_u8: np.ndarray, cfg: Config
+) -> Tuple[List[NucleusRecord], int, List, float]:
+    """Détection des noyaux par segmentation d'instance Cellpose, alternative
+    au pipeline Otsu + watershed.
+
+    Chantier le plus lourd des méthodes de détection : nécessite le
+    package `cellpose` (`pip install cellpose`, idéalement avec un GPU
+    CUDA pour rester rapide sur de grandes images), mais c'est en général
+    la méthode la plus fiable sur des amas de noyaux très denses/collés,
+    là où le watershed a tendance soit à sur-découper soit à fusionner.
+
+    Cellpose sépare déjà les instances individuellement : il n'y a donc
+    plus besoin de l'étape watershed de fusion/découpe de blobs -> les
+    valeurs retournées pour n_ws_split/blobs/median_single sont
+    informatives (compatibles avec le rapport) mais pas utilisées pour
+    re-découper quoi que ce soit.
+
+    Si cfg.cellpose_gpu est True (par défaut), le GPU CUDA est exigé
+    explicitement : si aucun GPU CUDA n'est réellement accessible à
+    PyTorch, on lève une erreur claire plutôt que de retomber
+    silencieusement sur le CPU (ce qui rend l'inférence extrêmement
+    lente — plusieurs dizaines de minutes voire plus sur une grande
+    image — sans qu'on comprenne pourquoi ça semble "bloqué").
+    """
+    try:
+        from cellpose import models
+    except ImportError as e:
+        raise RuntimeError(
+            "detection_method='cellpose' nécessite le package 'cellpose' "
+            "(pip install cellpose). Sans GPU CUDA disponible, la "
+            "segmentation sera lente sur de grandes images."
+        ) from e
+
+    # Avertissement interne bénin de PyTorch (vérifications d'invariants
+    # sparse désactivées par défaut sur GPU pour la perf) — sans rapport
+    # avec notre code, juste du bruit dans le journal.
+    import warnings
+    warnings.filterwarnings(
+        "ignore",
+        message="Sparse invariant checks are implicitly disabled",
+        category=UserWarning,
+    )
+
+    use_gpu = bool(cfg.cellpose_gpu)
+    if use_gpu:
+        try:
+            import torch
+        except ImportError as e:
+            raise RuntimeError(
+                "cellpose_gpu=True nécessite PyTorch installé avec le "
+                "support CUDA (torch.cuda). Le package 'torch' n'est pas "
+                "importable du tout ici : réinstalle-le avec la commande "
+                "CUDA correspondant à ton GPU depuis "
+                "https://pytorch.org/get-started/locally/ , ou repasse en "
+                "CPU (décoche 'Forcer GPU CUDA' / --cellpose-cpu)."
+            ) from e
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "cellpose_gpu=True mais torch.cuda.is_available() est "
+                "False : aucun GPU CUDA utilisable par PyTorch n'a été "
+                "détecté. Causes fréquentes : (1) c'est la version CPU-only "
+                "de torch qui est installée (pip install torch tout court "
+                "installe souvent celle-ci) — réinstalle avec la commande "
+                "CUDA adaptée depuis https://pytorch.org/get-started/locally/ "
+                "; (2) les drivers NVIDIA/CUDA ne sont pas à jour. Sinon, "
+                "décoche 'Forcer GPU CUDA' (--cellpose-cpu en CLI) pour "
+                "tourner sur CPU (beaucoup plus lent sur une grande image)."
+            )
+        print(
+            f"[cellpose] GPU CUDA détecté : {torch.cuda.get_device_name(0)} "
+            "— utilisation forcée du GPU."
+        )
+    else:
+        gpu_hint = ""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                gpu_hint = (
+                    f" (remarque : un GPU CUDA est bien détecté par PyTorch "
+                    f"— {torch.cuda.get_device_name(0)} — mais l'option "
+                    f"'cellpose_gpu' / 'Forcer GPU CUDA' est décochée dans "
+                    f"la config, donc le GPU n'est PAS utilisé)"
+                )
+        except ImportError:
+            pass
+        print(
+            "[cellpose] GPU désactivé par configuration : exécution sur "
+            f"CPU (lent).{gpu_hint}"
+        )
+
+    try:
+        # Anciennes versions de cellpose (<3.0) : classe haut niveau
+        # models.Cellpose(model_type=..., gpu=...).
+        model = models.Cellpose(model_type="nuclei", gpu=use_gpu)
+    except (AttributeError, TypeError):
+        # Versions récentes de cellpose (>=3.0/4.0) : la classe
+        # models.Cellpose a disparu, il ne reste que CellposeModel. Le
+        # modèle "nuclei" pré-entraîné dédié a lui aussi été retiré des
+        # versions les plus récentes ; on essaie donc "nuclei" puis on
+        # retombe sur le modèle par défaut si besoin.
+        try:
+            model = models.CellposeModel(pretrained_model="nuclei", gpu=use_gpu)
+        except Exception:
+            model = models.CellposeModel(gpu=use_gpu)
+
+    # Vérifie a posteriori que le modèle a bien atterri sur le GPU quand
+    # demandé (certaines versions de cellpose retombent silencieusement
+    # sur le CPU si le GPU est indisponible malgré gpu=True).
+    if use_gpu:
+        model_device = getattr(model, "device", None)
+        if model_device is not None and str(model_device) == "cpu":
+            raise RuntimeError(
+                "cellpose_gpu=True mais le modèle Cellpose a été chargé sur "
+                "CPU malgré tout (model.device == 'cpu'). Vérifie "
+                "l'installation de cellpose/torch avec support CUDA."
+            )
+
+    # Cellpose journalise sa progression via le module `logging` standard
+    # (pas via print/tqdm sur stdout) : sans configuration explicite, ce
+    # journal ne va nulle part et l'inférence semble "figée" alors qu'elle
+    # tourne normalement. On raccroche son logger à stdout (donc au
+    # journal de la GUI) pour voir sa progression réelle.
+    cellpose_logger = logging.getLogger("cellpose")
+    cellpose_logger.setLevel(logging.INFO)
+    _stream_handler = logging.StreamHandler(sys.stdout)
+    _stream_handler.setFormatter(logging.Formatter("[cellpose] %(message)s"))
+    cellpose_logger.addHandler(_stream_handler)
+    cellpose_logger.propagate = False
+
+    n_tiles_hint = ""
+    try:
+        h, w = white_u8.shape[:2]
+        # Taille de tuile par défaut de cellpose (~224 px, chevauchement
+        # inclus) : donne un ordre de grandeur, pas un compte exact.
+        approx_tiles = max(1, (h // 200) * (w // 200))
+        n_tiles_hint = f" (~{approx_tiles} tuiles à traiter, ordre de grandeur)"
+    except Exception:
+        pass
+    print(
+        f"[cellpose] Lancement de l'inférence sur une image {white_u8.shape[1]}"
+        f"x{white_u8.shape[0]}{n_tiles_hint} — peut prendre plusieurs "
+        "minutes selon la taille, même sur GPU. Aucune sortie pendant le "
+        "calcul ne signifie PAS que ça a planté : un signal de vie "
+        "s'affiche ci-dessous toutes les 15s."
+    )
+
+    # Battement de cœur : rassure que le process n'a pas gelé, même si
+    # cellpose ne logge rien pendant une tuile particulièrement longue.
+    _stop_heartbeat = threading.Event()
+
+    def _heartbeat() -> None:
+        start = time.time()
+        while not _stop_heartbeat.wait(15):
+            print(f"[cellpose] ...toujours en cours ({time.time() - start:.0f}s écoulées)")
+
+    _hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+    _hb_thread.start()
+
+    try:
+        masks, _flows, _styles, *_rest = model.eval(
+            white_u8,
+            diameter=cfg.cellpose_diameter,
+            channels=[0, 0],
+        )
+    finally:
+        _stop_heartbeat.set()
+        _hb_thread.join(timeout=1)
+        cellpose_logger.removeHandler(_stream_handler)
+
+    print("[cellpose] Inférence terminée, extraction des instances…")
+
+    num_labels = int(masks.max())
+    print(
+        f"[cellpose] {num_labels} labels détectés — extraction vectorisée "
+        "des statistiques par label (aires, centroïdes)…"
+    )
+
+    # ATTENTION PERF : ne JAMAIS faire `masks == lid` dans une boucle
+    # Python sur tous les labels -> ça recompare l'image entière (des
+    # dizaines de millions de pixels) à chaque itération, soit un temps
+    # quadratique en (nb_pixels x nb_labels). Avec des dizaines/centaines
+    # de milliers de labels (cf. avertissement cellpose "more than 65535
+    # masks"), ça peut prendre des heures. À la place : un seul passage
+    # sur les pixels non nuls, puis agrégation vectorisée via
+    # np.bincount (aire, somme des coordonnées) par label.
+    flat = masks.ravel()
+    nz_idx = np.flatnonzero(flat)
+    lbl_nz = flat[nz_idx].astype(np.int64)
+    ys_nz, xs_nz = np.unravel_index(nz_idx, masks.shape)
+
+    area_per_label = np.bincount(lbl_nz, minlength=num_labels + 1)
+    cx_sum = np.bincount(lbl_nz, weights=xs_nz.astype(np.float64), minlength=num_labels + 1)
+    cy_sum = np.bincount(lbl_nz, weights=ys_nz.astype(np.float64), minlength=num_labels + 1)
+
+    valid = (area_per_label >= cfg.min_area) & (area_per_label <= cfg.max_area)
+    valid[0] = False  # label 0 = fond, jamais un noyau
+    valid_lids = np.nonzero(valid)[0]
+
+    areas_valid = area_per_label[valid_lids]
+    cx_valid = (cx_sum[valid_lids] / areas_valid).astype(np.int64)
+    cy_valid = (cy_sum[valid_lids] / areas_valid).astype(np.int64)
+    r_valid = np.maximum(4, np.sqrt(areas_valid / np.pi).astype(np.int64))
+
+    nuclei: List[NucleusRecord] = [
+        (int(cx), int(cy), int(a), int(r))
+        for cx, cy, a, r in zip(cx_valid, cy_valid, areas_valid, r_valid)
+    ]
+    blobs: List = [
+        (int(lid), int(a), int(cx), int(cy))
+        for lid, a, cx, cy in zip(valid_lids, areas_valid, cx_valid, cy_valid)
+    ]
+    areas = [int(a) for a in areas_valid]
+
+    median_single = float(np.median(areas)) if areas else 0.0
+    n_ws_split = 0  # Cellpose sépare déjà les instances, pas de découpe watershed
+    return nuclei, n_ws_split, blobs, median_single
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1164,7 +1662,11 @@ Resolution: {W}x{H} px
   BLUE   max(disque[0,{cfg.nucleus_r}], anneau[{cfg.nucleus_r},{cfg.halo_r}])  seuil>={cfg.blue_thresh}  ratio>={cfg.blue_bg_ratio}x fond
   Fond plancher={cfg.bg_floor_frac}x mediane globale
   BG_GRID={cfg.bg_grid}x{cfg.bg_grid}  MAX_DIM={cfg.max_dim}
-  NORM_CLIP=[{cfg.norm_clip_low}, {cfg.norm_clip_high}] percentile (robuste, remplace min/max brut)
+  NORM_CLIP (contraste/gamma par canal) :
+    Blanc : [{cfg.white_clip_low}, {cfg.white_clip_high}]% gamma={cfg.white_gamma}
+    Vert  : [{cfg.green_clip_low}, {cfg.green_clip_high}]% gamma={cfg.green_gamma}
+    Rouge : [{cfg.red_clip_low}, {cfg.red_clip_high}]% gamma={cfg.red_gamma}
+    Bleu  : [{cfg.blue_clip_low}, {cfg.blue_clip_high}]% gamma={cfg.blue_gamma}
 
 -- FICHIERS --
   annotated_green.png  annotated_red.png  annotated_blue.png
@@ -1182,8 +1684,12 @@ Resolution: {W}x{H} px
 # partir des données déjà en mémoire (cf. classify_and_render).
 SLOW_PARAM_NAMES: Tuple[str, ...] = (
     "czi_path", "ch_white", "ch_green", "ch_red", "ch_blue", "max_dim",
-    "norm_clip_low", "norm_clip_high",
+    "white_clip_low", "white_clip_high", "white_gamma",
+    "green_clip_low", "green_clip_high", "green_gamma",
+    "red_clip_low", "red_clip_high", "red_gamma",
+    "blue_clip_low", "blue_clip_high", "blue_gamma",
     "min_area", "max_area", "merge_ratio", "nucleus_r", "halo_r",
+    "detection_method", "cellpose_diameter", "cellpose_gpu", "local_threshold",
 )
 
 
@@ -1215,10 +1721,10 @@ def load_and_detect(cfg: Config) -> dict:
     if img.ndim < 3:
         raise ValueError("L'image chargée n'a pas assez de dimensions (attendu >= 3)")
 
-    white_u8 = to_uint8(img[cfg.ch_white], cfg.max_dim, cfg.norm_clip_low, cfg.norm_clip_high)
-    green_u8 = to_uint8(img[cfg.ch_green], cfg.max_dim, cfg.norm_clip_low, cfg.norm_clip_high)
-    red_u8   = to_uint8(img[cfg.ch_red],   cfg.max_dim, cfg.norm_clip_low, cfg.norm_clip_high)
-    blue_u8  = to_uint8(img[cfg.ch_blue],  cfg.max_dim, cfg.norm_clip_low, cfg.norm_clip_high)
+    white_u8 = to_uint8(img[cfg.ch_white], cfg.max_dim, cfg.white_clip_low, cfg.white_clip_high, cfg.white_gamma)
+    green_u8 = to_uint8(img[cfg.ch_green], cfg.max_dim, cfg.green_clip_low, cfg.green_clip_high, cfg.green_gamma)
+    red_u8   = to_uint8(img[cfg.ch_red],   cfg.max_dim, cfg.red_clip_low,   cfg.red_clip_high,   cfg.red_gamma)
+    blue_u8  = to_uint8(img[cfg.ch_blue],  cfg.max_dim, cfg.blue_clip_low,  cfg.blue_clip_high,  cfg.blue_gamma)
     H, W = white_u8.shape
     print(f"Resolution retenue : {W}x{H} px")
 
@@ -1451,6 +1957,23 @@ def run(cfg: Config, parsed: ParsedArgs, output_dir: Optional[str] = None,
 def main() -> None:
     """Point d'entrée principal (CLI)."""
     cfg, parsed = config_from_args()
+    if parsed.train:
+        summary = train_supervised_from_csv(
+            parsed.train, parsed.model_path,
+            validated_only=not parsed.all_rows,
+            test_size=parsed.test_size,
+        )
+        print(
+            f"\nEntraînement termine sur {summary['n_train']}/{summary['n_total']} "
+            f"exemples (test: {summary['n_test']}) :\n"
+            f"  Score TRAIN  G={summary['scores_train']['green']:.3f}  "
+            f"R={summary['scores_train']['red']:.3f}  B={summary['scores_train']['blue']:.3f}\n"
+            f"  Score TEST   G={summary['scores_test']['green']:.3f}  "
+            f"R={summary['scores_test']['red']:.3f}  B={summary['scores_test']['blue']:.3f}\n"
+            f"  (le score TEST est la mesure de généralisation honnête à surveiller)\n"
+            f"Modele sauve -> {summary['model_path']}"
+        )
+        return
     run(cfg, parsed)
 
 

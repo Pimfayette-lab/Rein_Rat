@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import (
     Tk, StringVar, IntVar, DoubleVar, BooleanVar, filedialog, messagebox, END,
-    Toplevel, Label, Canvas,
+    Toplevel, Label, Canvas, TclError,
 )
 from tkinter import ttk
 
@@ -44,6 +44,7 @@ from core.cell_classifier_core import (  # noqa: E402
     rerender_with_corrections, save_corrections, load_corrections,
     corrections_summary, classification_label,
     extract_features, export_features_csv,
+    train_supervised_from_csv,
 )
 
 import numpy as np  # noqa: E402  (déjà une dépendance dure de core.cell_classifier_core)
@@ -51,6 +52,14 @@ import cv2  # noqa: E402  (déjà une dépendance dure de core.cell_classifier_c
 
 try:
     from PIL import Image, ImageTk
+    # Ce logiciel manipule volontairement des images scientifiques énormes
+    # (microscopie/drone), potentiellement bien au-delà de la limite
+    # "decompression bomb" par défaut de Pillow (~178 Mpx). Ces images
+    # viennent du fichier CZI que l'utilisateur charge lui-même (pas d'un
+    # tiers non fiable) : on désactive donc cette protection anti-DoS, sinon
+    # PIL lève DecompressionBombError dès qu'on désactive la limite de
+    # redimensionnement (max_dim vide) sur une grande image.
+    Image.MAX_IMAGE_PIXELS = None
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
@@ -163,12 +172,26 @@ class ZoomPanCanvas(ttk.Frame):
         self.zoom_label = ttk.Label(toolbar, text="", foreground="#666666")
         self.zoom_label.pack(side="right", padx=4)
         ttk.Label(
-            toolbar, text="molette = zoom · glisser = déplacer · double-clic = ajuster",
+            toolbar, text="molette = zoom · glisser/barres = déplacer · double-clic = ajuster",
             foreground="#888888", font=("TkDefaultFont", 8),
         ).pack(side="right", padx=8)
 
-        self.canvas = Canvas(self, bg="#101010", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
+        # Grille : canvas (0,0) + scrollbar verticale (0,1) + scrollbar
+        # horizontale (1,0), en plus du zoom/déplacement à la souris déjà
+        # existant -> permet de naviguer dans l'image sans molette/glisser,
+        # utile notamment avec un pavé tactile ou pour un repérage rapide.
+        grid_frame = ttk.Frame(self)
+        grid_frame.pack(fill="both", expand=True)
+        grid_frame.rowconfigure(0, weight=1)
+        grid_frame.columnconfigure(0, weight=1)
+
+        self.canvas = Canvas(grid_frame, bg="#101010", highlightthickness=0)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+
+        self.vbar = ttk.Scrollbar(grid_frame, orient="vertical", command=self._on_vscroll)
+        self.vbar.grid(row=0, column=1, sticky="ns")
+        self.hbar = ttk.Scrollbar(grid_frame, orient="horizontal", command=self._on_hscroll)
+        self.hbar.grid(row=1, column=0, sticky="ew")
 
         self.canvas.bind("<Configure>", lambda _e: self._redraw())
         self.canvas.bind("<ButtonPress-1>", self._on_press)
@@ -261,6 +284,7 @@ class ZoomPanCanvas(ttk.Frame):
         sx, sy, ox, oy = self._drag_start
         self._off_x = ox - (event.x - sx) / self._scale
         self._off_y = oy - (event.y - sy) / self._scale
+        self._clamp_offsets()
         self.clear_hover_highlight()
         self._redraw()
 
@@ -306,7 +330,80 @@ class ZoomPanCanvas(ttk.Frame):
         self._scale = new_scale
         self._off_x = img_x - cx / self._scale
         self._off_y = img_y - cy / self._scale
+        self._clamp_offsets()
         self._redraw()
+
+    def _clamp_offsets(self) -> None:
+        """Empêche le cadrage de s'éloigner indéfiniment de l'image (utile
+        surtout pour que les barres de scroll restent cohérentes)."""
+        if self._img is None:
+            return
+        cw = max(self.canvas.winfo_width(), 1)
+        ch = max(self.canvas.winfo_height(), 1)
+        view_w = cw / self._scale
+        view_h = ch / self._scale
+        # Un peu de marge (une demi-vue) pour ne pas bloquer trop tôt quand
+        # l'image est plus petite que la fenêtre.
+        max_off_x = max(-view_w / 2, self._img_w - view_w / 2)
+        max_off_y = max(-view_h / 2, self._img_h - view_h / 2)
+        min_off_x = -view_w / 2
+        min_off_y = -view_h / 2
+        self._off_x = min(max(self._off_x, min_off_x), max_off_x)
+        self._off_y = min(max(self._off_y, min_off_y), max_off_y)
+
+    def _on_hscroll(self, *args) -> None:
+        if self._img is None:
+            return
+        cw = max(self.canvas.winfo_width(), 1)
+        view_w = cw / self._scale
+        action = args[0]
+        if action == "moveto":
+            frac = float(args[1])
+            self._off_x = frac * self._img_w
+        elif action == "scroll":
+            num = float(args[1])
+            what = args[2]
+            step = view_w * 0.9 if what == "pages" else max(1.0, view_w * 0.08)
+            self._off_x += num * step
+        self._clamp_offsets()
+        self.clear_hover_highlight()
+        self._redraw()
+
+    def _on_vscroll(self, *args) -> None:
+        if self._img is None:
+            return
+        ch = max(self.canvas.winfo_height(), 1)
+        view_h = ch / self._scale
+        action = args[0]
+        if action == "moveto":
+            frac = float(args[1])
+            self._off_y = frac * self._img_h
+        elif action == "scroll":
+            num = float(args[1])
+            what = args[2]
+            step = view_h * 0.9 if what == "pages" else max(1.0, view_h * 0.08)
+            self._off_y += num * step
+        self._clamp_offsets()
+        self.clear_hover_highlight()
+        self._redraw()
+
+    def _update_scrollbars(self) -> None:
+        """Met à jour la position/taille des poignées de scrollbar pour
+        refléter la portion actuellement visible de l'image."""
+        if self._img is None or self._img_w <= 0 or self._img_h <= 0:
+            self.hbar.set(0.0, 1.0)
+            self.vbar.set(0.0, 1.0)
+            return
+        cw = max(self.canvas.winfo_width(), 1)
+        ch = max(self.canvas.winfo_height(), 1)
+        view_w = cw / self._scale
+        view_h = ch / self._scale
+        lo_x = self._off_x / self._img_w
+        hi_x = (self._off_x + view_w) / self._img_w
+        lo_y = self._off_y / self._img_h
+        hi_y = (self._off_y + view_h) / self._img_h
+        self.hbar.set(max(0.0, lo_x), min(1.0, hi_x))
+        self.vbar.set(max(0.0, lo_y), min(1.0, hi_y))
 
     def _redraw(self) -> None:
         self.canvas.delete("all")
@@ -318,6 +415,7 @@ class ZoomPanCanvas(ttk.Frame):
                 font=("TkDefaultFont", 10),
             )
             self.zoom_label.configure(text="")
+            self._update_scrollbars()
             return
 
         x0, y0 = self._off_x, self._off_y
@@ -330,17 +428,27 @@ class ZoomPanCanvas(ttk.Frame):
             self.zoom_label.configure(text=f"{self._scale * 100:.0f}%")
             return
 
-        crop = self._img.crop((crop_x0, crop_y0, crop_x1, crop_y1))
-        disp_w = max(1, round((crop_x1 - crop_x0) * self._scale))
-        disp_h = max(1, round((crop_y1 - crop_y0) * self._scale))
-        resample = Image.NEAREST if self._scale > 1 else Image.BILINEAR
-        resized = crop.resize((disp_w, disp_h), resample)
-        self._photo = ImageTk.PhotoImage(resized)
+        try:
+            crop = self._img.crop((crop_x0, crop_y0, crop_x1, crop_y1))
+            disp_w = max(1, round((crop_x1 - crop_x0) * self._scale))
+            disp_h = max(1, round((crop_y1 - crop_y0) * self._scale))
+            resample = Image.NEAREST if self._scale > 1 else Image.BILINEAR
+            resized = crop.resize((disp_w, disp_h), resample)
+            self._photo = ImageTk.PhotoImage(resized)
+        except Exception as e:
+            self.canvas.create_text(
+                cw / 2, ch / 2,
+                text=f"Erreur d'affichage de l'aperçu :\n{e}",
+                fill="#ff6666", font=("TkDefaultFont", 9), justify="center",
+            )
+            self.zoom_label.configure(text="")
+            return
         px = (crop_x0 - x0) * self._scale
         py = (crop_y0 - y0) * self._scale
         self.canvas.create_image(px, py, anchor="nw", image=self._photo, tags="base_image")
         self.zoom_label.configure(text=f"{self._scale * 100:.0f}%")
         self._redraw_highlights()
+        self._update_scrollbars()
 
     def _redraw_highlights(self) -> None:
         """Redessine UNIQUEMENT les anneaux de surbrillance (survol/sélection)
@@ -380,10 +488,32 @@ PARAM_GROUPS: list[tuple[str, list[tuple[str, str, str]]]] = [
     ]),
     ("Chargement image", [
         ("max_dim", "Dimension max (px, vide = pas de limite)", "int_opt"),
-        ("norm_clip_low", "Normalisation — percentile bas (%)", "float"),
-        ("norm_clip_high", "Normalisation — percentile haut (%)", "float"),
+    ]),
+    ("Contraste — Canal blanc (détection)", [
+        ("white_clip_low", "Percentile bas (%)", "float"),
+        ("white_clip_high", "Percentile haut (%)", "float"),
+        ("white_gamma", "Gamma (luminosité)", "float"),
+    ]),
+    ("Contraste — Canal vert (AQP2)", [
+        ("green_clip_low", "Percentile bas (%)", "float"),
+        ("green_clip_high", "Percentile haut (%)", "float"),
+        ("green_gamma", "Gamma (luminosité)", "float"),
+    ]),
+    ("Contraste — Canal rouge (AE1)", [
+        ("red_clip_low", "Percentile bas (%)", "float"),
+        ("red_clip_high", "Percentile haut (%)", "float"),
+        ("red_gamma", "Gamma (luminosité)", "float"),
+    ]),
+    ("Contraste — Canal bleu", [
+        ("blue_clip_low", "Percentile bas (%)", "float"),
+        ("blue_clip_high", "Percentile haut (%)", "float"),
+        ("blue_gamma", "Gamma (luminosité)", "float"),
     ]),
     ("Détection des noyaux", [
+        ("detection_method", "Méthode de détection", "choice:watershed,cellpose"),
+        ("cellpose_gpu", "Cellpose : forcer GPU CUDA", "bool"),
+        ("cellpose_diameter", "Diamètre Cellpose (px, vide = auto)", "float_opt"),
+        ("local_threshold", "Seuil Otsu local (au lieu d'un seuil global)", "bool"),
         ("min_area", "Aire minimale (px²)", "int"),
         ("max_area", "Aire maximale (px²)", "int"),
         ("merge_ratio", "Ratio de fusion (watershed)", "float"),
@@ -436,24 +566,36 @@ TOOLTIPS: dict[str, str] = {
         "peuvent fusionner et le signal fin est lissé. Plus grand (ou vide) "
         "= plus précis mais plus lent et gourmand en RAM."
     ),
-    "norm_clip_low": (
-        "Percentile bas (0-100) utilisé pour normaliser chaque canal en "
-        "0-255, à la place d'un simple minimum brut. Les pixels en dessous "
-        "de ce percentile sont saturés à 0 (noir) au lieu d'étirer "
-        "l'échelle vers eux. Augmenter légèrement (ex. 1-2) ignore un peu "
-        "plus de bruit de fond très sombre."
+    "detection_method": (
+        "'watershed' (défaut) : seuillage Otsu + découpe watershed des "
+        "blobs fusionnés, rapide. 'cellpose' : segmentation par instance "
+        "via Cellpose — plus robuste sur des amas de noyaux très "
+        "denses/collés, mais nécessite le package `cellpose` (pip install "
+        "cellpose) et idéalement un GPU CUDA (voir 'Forcer GPU CUDA' "
+        "ci-dessous), sans quoi c'est extrêmement lent sur une grande "
+        "image. À réserver au cas où le comptage sur amas denses est le "
+        "principal problème."
     ),
-    "norm_clip_high": (
-        "Percentile haut (0-100) utilisé pour normaliser chaque canal en "
-        "0-255, à la place d'un simple maximum brut. C'est le paramètre "
-        "clé pour la robustesse aux pixels chauds (saturation capteur, "
-        "poussière fluorescente, artefact ponctuel) : avec un max brut, un "
-        "seul pixel extrême écrase tout le signal réel dans les valeurs "
-        "basses, ce qui produit des faux négatifs (seuils GREEN/RED/BLUE "
-        "jamais atteints). Baisser cette valeur (ex. 99.0-99.5) sature ces "
-        "quelques pixels extrêmes au lieu de les laisser dicter toute "
-        "l'échelle, et redonne du contraste au signal utile. Mettre à 100 "
-        "retrouve l'ancien comportement min/max brut."
+    "cellpose_gpu": (
+        "Si coché (défaut), Cellpose EXIGE un GPU CUDA utilisable par "
+        "PyTorch : si aucun n'est détecté, une erreur claire est levée "
+        "plutôt que de tourner silencieusement (et très lentement) sur "
+        "CPU. Décoche uniquement si tu veux volontairement tourner sur "
+        "CPU (test, pas de GPU disponible). Sans effet si la méthode de "
+        "détection n'est pas 'cellpose'."
+    ),
+    "cellpose_diameter": (
+        "Diamètre moyen (px) des noyaux attendu par Cellpose. Laisser vide "
+        "pour une estimation automatique (recommandé au début). Utilisé "
+        "uniquement si la méthode de détection est 'cellpose'."
+    ),
+    "local_threshold": (
+        "Si coché, remplace le seuil Otsu global unique par un seuil Otsu "
+        "calculé par tuile (grille 'bg_grid') puis interpolé, comme pour la "
+        "carte de fond local. Utile seulement si vous observez des zones "
+        "sur- ou sous-détectées selon leur position dans l'image "
+        "(éclairage non homogène). Sans effet si la méthode de détection "
+        "est 'cellpose'."
     ),
     "min_area": (
         "Aire minimale (px²) pour qu'un blob détecté soit considéré comme "
@@ -553,6 +695,42 @@ TOOLTIPS: dict[str, str] = {
     ),
 }
 
+_CHANNEL_TOOLTIP_LABELS = {
+    "white": "blanc (détection des noyaux)",
+    "green": "vert (AQP2)",
+    "red": "rouge (AE1)",
+    "blue": "bleu",
+}
+for _ch, _label in _CHANNEL_TOOLTIP_LABELS.items():
+    TOOLTIPS[f"{_ch}_clip_low"] = (
+        f"Percentile bas (0-100) utilisé pour normaliser le canal {_label} "
+        f"en 0-255, à la place d'un simple minimum brut. Les pixels en "
+        f"dessous de ce percentile sont saturés à 0 (noir). Augmenter "
+        f"légèrement (ex. 1-2) ignore un peu plus de bruit de fond très "
+        f"sombre SUR CE CANAL UNIQUEMENT."
+    )
+    TOOLTIPS[f"{_ch}_clip_high"] = (
+        f"Percentile haut (0-100) utilisé pour normaliser le canal {_label} "
+        f"en 0-255, à la place d'un simple maximum brut. Paramètre clé "
+        f"pour la robustesse aux pixels chauds (saturation, poussière, "
+        f"artefact ponctuel) : un max brut laisse un seul pixel extrême "
+        f"écraser tout le signal réel vers le noir -> faux négatifs. "
+        f"Baisser cette valeur (ex. 99.0-99.5) sature ces pixels extrêmes "
+        f"au lieu de les laisser dicter toute l'échelle, et redonne du "
+        f"contraste au signal utile de ce canal. 100 = ancien comportement "
+        f"min/max brut."
+    )
+    TOOLTIPS[f"{_ch}_gamma"] = (
+        f"Ajuste la LUMINOSITÉ des tons moyens du canal {_label}, SANS "
+        f"changer le contraste (les bornes noir/blanc fixées par les "
+        f"percentiles ci-dessus ne bougent pas). > 1 éclaircit (utile pour "
+        f"rendre visible un signal faible ou aider le comptage sur un "
+        f"canal peu marqué) ; < 1 assombrit (utile pour atténuer un fond "
+        f"trop présent) ; 1.0 = neutre. Affecte À LA FOIS l'aperçu visuel "
+        f"ET les seuils de classification (GREEN/RED/BLUE), puisqu'ils "
+        f"s'appliquent sur ce même canal normalisé."
+    )
+
 
 class CellClassifierGUI:
     def __init__(self, root: Tk) -> None:
@@ -600,11 +778,21 @@ class CellClassifierGUI:
         self._active_dialog: Toplevel | None = None
         self._active_dialog_idx: int | None = None
 
+        # ── État de l'entraînement supervisé (CSV validé, split train/test) ──
+        self.train_csv_path = StringVar(value="")
+        self.train_model_out_path = StringVar(value="cell_classifier_model.pkl")
+        self.train_test_size = DoubleVar(value=0.25)
+        self.train_validated_only = BooleanVar(value=True)
+        self.train_status_var = StringVar(value="")
+        self.train_thread: threading.Thread | None = None
+        self.training_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
+
         self._build_layout()
         self._wire_param_traces()
         self._install_global_exception_handler()
         self._poll_log_queue()
         self._poll_tuning_queue()
+        self._poll_training_queue()
 
     def _install_global_exception_handler(self) -> None:
         """Par défaut, Tkinter avale silencieusement toute exception levée
@@ -646,6 +834,7 @@ class CellClassifierGUI:
         self._build_file_section(left)
         self._build_tuning_section(left)   # mode réglage interactif (aperçu live)
         self._build_validation_section(left)  # validation manuelle (vérité terrain)
+        self._build_training_section(left)  # entraînement supervisé (CSV validé, split train/test)
         self._build_actions(left)          # épinglé en bas -> toujours visible
         self._build_params_notebook(left)  # remplit l'espace restant, défilable
 
@@ -725,6 +914,71 @@ class CellClassifierGUI:
         self.export_progress.pack(side="left")
         ttk.Label(
             row3, textvariable=self.export_status_var, foreground="#a55a2a",
+            wraplength=460, justify="left",
+        ).pack(side="left", padx=8, fill="x", expand=True)
+
+    def _build_training_section(self, parent: ttk.Frame) -> None:
+        """Section « entraînement supervisé » : ferme la boucle du système
+        de validation manuelle. Prend un CSV exporté (features + gt_*),
+        réserve une fraction des noyaux en test (jamais vue à
+        l'entraînement) et rapporte le score sur ce test — la vraie mesure
+        de généralisation, contrairement au score train de
+        l'auto-entraînement (--self-train)."""
+        box = ttk.LabelFrame(parent, text="🧠 Entraînement supervisé (CSV validé)")
+        box.pack(fill="x", pady=(0, 8))
+
+        row1 = ttk.Frame(box)
+        row1.pack(fill="x", padx=8, pady=(6, 2))
+        ttk.Label(row1, text="CSV features :", width=16).pack(side="left")
+        ttk.Entry(row1, textvariable=self.train_csv_path).pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(row1, text="Parcourir…", command=self._browse_train_csv).pack(side="left")
+
+        row2 = ttk.Frame(box)
+        row2.pack(fill="x", padx=8, pady=2)
+        ttk.Label(row2, text="Modèle à sauver :", width=16).pack(side="left")
+        ttk.Entry(row2, textvariable=self.train_model_out_path).pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(row2, text="…", width=3, command=self._browse_train_model_out).pack(side="left")
+
+        row3 = ttk.Frame(box)
+        row3.pack(fill="x", padx=8, pady=2)
+        validated_chk = ttk.Checkbutton(
+            row3, text="Uniquement les noyaux validés manuellement (recommandé)",
+            variable=self.train_validated_only,
+        )
+        validated_chk.pack(side="left")
+        ToolTip(
+            validated_chk,
+            "Si coché, n'entraîne que sur les lignes 'validated'=1 du CSV "
+            "(vérité terrain confirmée par un clic dans la GUI). Décoché, "
+            "utilise aussi les lignes non validées, qui recopient la "
+            "prédiction brute — le modèle réapprendrait alors en partie ses "
+            "propres seuils, ce qui fausse l'évaluation.",
+        )
+
+        row4 = ttk.Frame(box)
+        row4.pack(fill="x", padx=8, pady=2)
+        ttk.Label(row4, text="Fraction test :").pack(side="left")
+        ttk.Spinbox(
+            row4, from_=0.05, to=0.5, increment=0.05, width=6,
+            textvariable=self.train_test_size,
+        ).pack(side="left", padx=(4, 12))
+        ToolTip(
+            row4,
+            "Fraction des noyaux réservée à l'évaluation (jamais vue "
+            "pendant l'entraînement). 0.25 = 25% des noyaux servent "
+            "uniquement à mesurer la généralisation.",
+        )
+        self.train_btn = ttk.Button(
+            row4, text="🎯 Entraîner (train/test split)", command=self._on_train_clicked,
+        )
+        self.train_btn.pack(side="right")
+
+        row5 = ttk.Frame(box)
+        row5.pack(fill="x", padx=8, pady=(2, 6))
+        self.train_progress = ttk.Progressbar(row5, mode="indeterminate", length=140)
+        self.train_progress.pack(side="left")
+        ttk.Label(
+            row5, textvariable=self.train_status_var, foreground="#2f6f2f",
             wraplength=460, justify="left",
         ).pack(side="left", padx=8, fill="x", expand=True)
 
@@ -881,8 +1135,9 @@ class CellClassifierGUI:
             widget = ttk.Combobox(row, textvariable=v, values=options, width=10,
                                    state="readonly")
             widget.pack(side="left")
-        elif kind == "int_opt":
-            # entier optionnel (ex: max_dim=None)
+        elif kind in ("int_opt", "float_opt"):
+            # valeur numérique optionnelle (ex: max_dim=None) -> case vide
+            # par défaut plutôt que d'afficher littéralement "None".
             v = StringVar(value="" if default is None else str(default))
             widget = ttk.Entry(row, textvariable=v, width=12)
             widget.pack(side="left")
@@ -981,6 +1236,22 @@ class CellClassifierGUI:
         if path:
             self.model_path.set(path)
 
+    def _browse_train_csv(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Choisir le CSV de features exporté",
+            filetypes=[("CSV", "*.csv"), ("Tous les fichiers", "*.*")],
+        )
+        if path:
+            self.train_csv_path.set(path)
+
+    def _browse_train_model_out(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="Fichier modèle à sauver (.pkl)", defaultextension=".pkl",
+            filetypes=[("Modèle pickle", "*.pkl"), ("Tous les fichiers", "*.*")],
+        )
+        if path:
+            self.train_model_out_path.set(path)
+
     def _open_output_dir(self) -> None:
         path = self.output_dir.get()
         if not path or not Path(path).exists():
@@ -1006,6 +1277,8 @@ class CellClassifierGUI:
                     value = bool(raw)
                 elif kind == "int_opt":
                     value = None if str(raw).strip() == "" else int(raw)
+                elif kind == "float_opt":
+                    value = None if str(raw).strip() == "" else float(raw)
                 elif kind == "int":
                     value = int(raw)
                 elif kind == "float":
@@ -1051,7 +1324,7 @@ class CellClassifierGUI:
             if attr not in data:
                 continue
             value = data[attr]
-            if kind == "int_opt" and value is None:
+            if kind in ("int_opt", "float_opt") and value is None:
                 var.set("")
             else:
                 var.set(value)
@@ -1062,7 +1335,7 @@ class CellClassifierGUI:
         defaults = Config()
         for attr, (var, kind) in self.vars.items():
             default = getattr(defaults, attr)
-            if kind == "int_opt":
+            if kind in ("int_opt", "float_opt"):
                 var.set("" if default is None else str(default))
             else:
                 var.set(default)
@@ -1480,6 +1753,130 @@ class CellClassifierGUI:
             self._log("\n--- ERREUR (export CSV) ---\n" + str(payload) + "\n")
             messagebox.showerror(
                 "Erreur d'export", "L'export a échoué. Voir le journal pour le détail.")
+
+    # ── Entraînement supervisé (CSV validé, split train/test) ────────────
+
+    def _on_train_clicked(self) -> None:
+        if self.train_thread is not None and self.train_thread.is_alive():
+            messagebox.showwarning("Entraînement en cours", "Un entraînement est déjà en cours.")
+            return
+        csv_path = self.train_csv_path.get().strip()
+        if not csv_path:
+            messagebox.showwarning(
+                "CSV manquant",
+                "Choisissez d'abord un CSV de features (bouton « 📤 Exporter "
+                "CSV » de la section Validation manuelle, ou un export déjà "
+                "existant).",
+            )
+            return
+        if not Path(csv_path).exists():
+            messagebox.showerror("Fichier introuvable", f"Introuvable :\n{csv_path}")
+            return
+        model_out = self.train_model_out_path.get().strip()
+        if not model_out:
+            messagebox.showwarning("Chemin manquant", "Indiquez où sauver le modèle entraîné.")
+            return
+        try:
+            test_size = float(self.train_test_size.get())
+        except (TclError, ValueError):
+            messagebox.showerror("Valeur invalide", "La fraction de test doit être un nombre.")
+            return
+        if not (0.05 <= test_size <= 0.5):
+            messagebox.showerror("Valeur invalide", "La fraction de test doit être entre 0.05 et 0.5.")
+            return
+
+        validated_only = self.train_validated_only.get()
+        self.train_btn.configure(state="disabled")
+        self.train_progress.start(12)
+        self.train_status_var.set("⏳ Entraînement en cours…")
+        self._log(
+            f"[Entraînement] Démarrage sur {csv_path} "
+            f"(validated_only={validated_only}, test_size={test_size})…\n"
+        )
+        self.train_thread = threading.Thread(
+            target=self._train_worker,
+            args=(csv_path, model_out, validated_only, test_size),
+            daemon=True,
+        )
+        self.train_thread.start()
+
+    def _train_worker(
+        self, csv_path: str, model_out: str, validated_only: bool, test_size: float,
+    ) -> None:
+        writer = QueueWriter(self.log_queue)
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        sys.stdout = writer
+        sys.stderr = writer
+        t0 = time.time()
+        try:
+            summary = train_supervised_from_csv(
+                csv_path, model_out,
+                validated_only=validated_only, test_size=test_size,
+            )
+            summary["elapsed"] = time.time() - t0
+            self.training_queue.put(("train_ok", summary))
+        except Exception:
+            self.training_queue.put(("train_error", traceback.format_exc()))
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
+
+    def _poll_training_queue(self) -> None:
+        try:
+            while True:
+                try:
+                    kind, payload = self.training_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._handle_training_item(kind, payload)
+                except Exception:
+                    self._log(
+                        "\n--- ERREUR interne (traitement du résultat d'entraînement) ---\n"
+                        + traceback.format_exc() + "\n"
+                    )
+        finally:
+            self.root.after(150, self._poll_training_queue)
+
+    def _handle_training_item(self, kind: str, payload) -> None:
+        if kind == "train_ok":
+            self.train_btn.configure(state="normal")
+            self.train_progress.stop()
+            st = payload["scores_train"]
+            te = payload["scores_test"]
+            self.train_status_var.set(
+                f"✓ Entraîné en {payload['elapsed']:.1f} s sur "
+                f"{payload['n_train']}/{payload['n_total']} noyaux "
+                f"(test: {payload['n_test']}) — "
+                f"TEST G={te['green']:.2f} R={te['red']:.2f} B={te['blue']:.2f}"
+            )
+            self._log(
+                f"[Entraînement] Terminé en {payload['elapsed']:.2f} s\n"
+                f"  Score TRAIN  G={st['green']:.3f}  R={st['red']:.3f}  B={st['blue']:.3f}\n"
+                f"  Score TEST   G={te['green']:.3f}  R={te['red']:.3f}  B={te['blue']:.3f}\n"
+                f"  (le score TEST — jamais vu à l'entraînement — est la mesure "
+                f"de généralisation à surveiller, pas le score train)\n"
+                f"  Modèle sauvé -> {payload['model_path']}\n"
+            )
+            messagebox.showinfo(
+                "Entraînement terminé",
+                f"{payload['n_train']} noyaux d'entraînement / "
+                f"{payload['n_test']} de test.\n\n"
+                f"Score TEST (généralisation) :\n"
+                f"  Vert  : {te['green']:.3f}\n"
+                f"  Rouge : {te['red']:.3f}\n"
+                f"  Bleu  : {te['blue']:.3f}\n\n"
+                f"Modèle sauvé dans :\n{payload['model_path']}",
+            )
+        elif kind == "train_error":
+            self.train_btn.configure(state="normal")
+            self.train_progress.stop()
+            self.train_status_var.set("❌ Échec de l'entraînement — voir le journal.")
+            self._log("\n--- ERREUR (entraînement supervisé) ---\n" + str(payload) + "\n")
+            messagebox.showerror(
+                "Erreur d'entraînement",
+                "L'entraînement a échoué. Voir le journal pour le détail.",
+            )
 
 
     # ── Validation manuelle (clic sur un noyau dans l'aperçu) ────────────
